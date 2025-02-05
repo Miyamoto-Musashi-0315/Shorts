@@ -1,0 +1,185 @@
+import os
+import asyncio
+import torch
+import requests
+import numpy as np
+from PIL import Image, ImageEnhance
+from moviepy.editor import (
+    ImageClip, concatenate_videoclips, AudioFileClip,
+    CompositeVideoClip, TextClip, vfx
+)
+from huggingface_hub import login
+import edge_tts
+import nest_asyncio
+from diffusers import StableDiffusionPipeline
+
+# Enable nested async loops
+nest_asyncio.apply()
+
+# Login to Hugging Face
+hf_token = 'hf_abcd'  # Replace with your token
+login(token=hf_token)
+
+# Load Stable Diffusion Model
+pipe = StableDiffusionPipeline.from_pretrained(
+    "runwayml/stable-diffusion-v1-5",
+    torch_dtype=torch.float16
+).to("cuda")
+
+# LLaMA API Configuration
+LLAMA_API_URL = "https://api.llamaapi.com/generate"
+LLAMA_API_KEY = "your_llama_api_key_here"
+
+def fetch_random_story():
+    """Fetches a random Hindu mythology story and image prompts using LLaMA API"""
+    prompt = (
+        "Generate a short 4-sentence Hindu mythology story and provide a suitable "
+        "image prompt for each sentence, describing it in Raja Ravi Varma painting style."
+        "Format the response as JSON with 'story' (list of sentences) and 'prompts' (list of prompts)."
+    )
+    
+    response = requests.post(
+        LLAMA_API_URL,
+        json={"prompt": prompt, "max_tokens": 400},
+        headers={"Authorization": f"Bearer {LLAMA_API_KEY}"}
+    )
+
+    if response.status_code == 200:
+        data = response.json()
+        return [
+            {"text": data["story"][i], "prompt": data["prompts"][i], "duration": 8}
+            for i in range(4)
+        ]
+    else:
+        raise Exception(f"Failed to fetch story: {response.text}")
+
+async def generate_audio(text, output_path):
+    """Generates speech from text using Edge TTS"""
+    voice = "en-US-ChristopherNeural"
+    communicate = edge_tts.Communicate(text, voice)
+    await communicate.save(output_path)
+
+def generate_image_with_stable_diffusion(prompt, output_path, height=1920, width=1080):
+    """Generates an image using Stable Diffusion"""
+    style_prompt = (
+        "oil painting by Raja Ravi Varma, classical Indian painting, "
+        "rich colors, dramatic lighting, ornate details, traditional Indian aesthetics, "
+        "masterpiece, divine atmosphere, highly detailed, photorealistic quality, "
+        "museum quality artwork, golden hour lighting"
+    )
+    negative_prompt = (
+        "cartoon, anime, sketches, 3d, digital art, modern, contemporary, "
+        "low quality, blurry, distorted, deformed, amateur, photographic"
+    )
+
+    full_prompt = f"{prompt}, {style_prompt}"
+
+    # Generate image
+    image = pipe(
+        full_prompt,
+        negative_prompt=negative_prompt,
+        height=height,
+        width=width,
+        guidance_scale=12.0,
+        num_inference_steps=100
+    ).images[0]
+
+    # Post-process image
+    enhancer = ImageEnhance.Color(image)
+    image = enhancer.enhance(1.2)
+
+    enhancer = ImageEnhance.Contrast(image)
+    image = enhancer.enhance(1.1)
+
+    image.save(output_path)
+    return image
+
+def create_word_by_word_clips(text, duration, font_size=120):
+    """Creates large, centered text animation word-by-word"""
+    words = text.split()
+    word_duration = duration / len(words)
+    word_clips = []
+
+    for i, word in enumerate(words):
+        txt_clip = TextClip(
+            word,
+            fontsize=font_size,
+            color='white',
+            font='Arial-Bold',
+            stroke_color='black',
+            stroke_width=5
+        ).set_duration(word_duration)
+
+        glow = txt_clip.set_color('yellow').set_opacity(0.3)
+        glow = glow.resize(lambda t: 1.1)
+
+        txt_composite = CompositeVideoClip([glow, txt_clip])
+        txt_composite = txt_composite.set_start(i * word_duration)
+        txt_composite = txt_composite.set_position(('center', 'center'))
+
+        txt_composite = txt_composite.crossfadein(0.3)
+        txt_composite = txt_composite.crossfadeout(0.3)
+
+        word_clips.append(txt_composite)
+
+    return word_clips
+
+async def main():
+    os.makedirs("generated_images", exist_ok=True)
+    os.makedirs("generated_audio", exist_ok=True)
+
+    # Fetch a random Hindu mythology story
+    story = fetch_random_story()
+
+    final_clips = []
+
+    for idx, entry in enumerate(story):
+        print(f"Generating scene {idx + 1}/{len(story)}...")
+
+        # Generate image and audio
+        image_path = f"generated_images/image_{idx}.png"
+        generate_image_with_stable_diffusion(entry["prompt"], image_path)
+
+        audio_path = f"generated_audio/audio_{idx}.mp3"
+        await generate_audio(entry["text"], audio_path)
+
+        # Load audio
+        audio_clip = AudioFileClip(audio_path)
+        clip_duration = entry["duration"]
+
+        # Create base image clip
+        image_clip = (ImageClip(image_path)
+                     .set_duration(clip_duration)
+                     .set_opacity(0.7)
+                     .resize(lambda t: 1 + 0.05 * t))
+
+        # Create text clips
+        word_clips = create_word_by_word_clips(entry["text"], clip_duration)
+
+        # Combine all elements
+        scene = CompositeVideoClip([image_clip] + word_clips)
+
+        # Add transitions
+        if idx > 0:
+            scene = scene.crossfadein(1.0)
+        if idx < len(story) - 1:
+            scene = scene.crossfadeout(1.0)
+
+        # Add audio and effects
+        scene = scene.set_audio(audio_clip)
+        scene = scene.fx(vfx.colorx, 1.2)
+        scene = scene.fx(vfx.lum_contrast, lum=0, contrast=1.1)
+
+        final_clips.append(scene)
+
+    # Create final video
+    final_video = concatenate_videoclips(final_clips, method="compose")
+
+    # Write output
+    output_path = "final_video.mp4"
+    final_video.write_videofile(output_path, fps=24, codec="libx264", audio_codec="aac")
+    print(f"Video saved to {output_path}")
+
+# Run the async main function
+if __name__ == "__main__":
+    asyncio.run(main())
